@@ -33,7 +33,10 @@ class VectorQuantizer(nn.Module):
         self.embedding.weight.data.uniform_(-1/num_embeddings, 1/num_embeddings)
         
     def forward(self, z):
-        # Reshape z -> (batch, height, width, channel)
+        # Save original shape
+        orig_shape = z.shape
+        
+        # Reshape z -> (batch, height * width, channel)
         z = z.permute(0, 2, 3, 1).contiguous()
         z_flattened = z.view(-1, z.shape[-1])
         
@@ -46,21 +49,61 @@ class VectorQuantizer(nn.Module):
         min_encoding_indices = torch.argmin(d, dim=1)
         z_q = self.embedding(min_encoding_indices).view(z.shape)
         
-        # Reshape back
-        z_q = z_q.permute(0, 3, 1, 2)
+        # Reshape back to original shape
+        z_q = z_q.permute(0, 3, 1, 2).contiguous()
+        
+        # Make sure z_q has the same shape as input
+        assert z_q.shape == orig_shape, f"Shape mismatch: {z_q.shape} vs {orig_shape}"
         
         # Use straight-through estimator
-        z_q = z + (z_q - z).detach()
+        z_q = z.permute(0, 3, 1, 2).contiguous() + (z_q - z.permute(0, 3, 1, 2).contiguous()).detach()
+        
+        # Reshape indices to match spatial dimensions
+        min_encoding_indices = min_encoding_indices.view(orig_shape[0], orig_shape[2], orig_shape[3])
+        
         return z_q, min_encoding_indices
 
 # Add patch-based encoding to VQVAE
 class SimpleVQVAE(nn.Module):
     def __init__(self, num_embeddings=1024, embedding_dim=32):
         super().__init__()
-        self.encoder = SimpleEncoder(latent_dim=embedding_dim)
+        self.encoder = SimpleEncoder(in_channels=3, latent_dim=embedding_dim)
         self.quantizer = VectorQuantizer(num_embeddings, embedding_dim)
-        self.decoder = SimpleDecoder(latent_dim=embedding_dim)
+        self.decoder = SimpleDecoder(latent_dim=embedding_dim, out_channels=3)
+        self.embedding_dim = embedding_dim
+    
+    def forward(self, x):
+        """Forward pass through the VQVAE"""
+        # Encode the input
+        z = self.encoder(x)  # Shape: [B, embedding_dim, H/4, W/4]
         
+        # Quantize the latent representations
+        z_q, indices = self.quantizer(z)  # Same shape as z
+        
+        # Decode
+        x_recon = self.decoder(z_q)  # Shape: [B, 3, H, W]
+        
+        return x_recon, z_q, indices
+    
+    def encode_to_indices(self, x):
+        """Encode input to indices only"""
+        z = self.encoder(x)
+        _, indices = self.quantizer(z)
+        return indices
+    
+    def decode_from_indices(self, indices):
+        """Decode from indices"""
+        # Get original spatial dimensions
+        B, H, W = indices.shape
+        
+        # Get embeddings and reshape to match expected decoder input shape
+        z_q = self.quantizer.embedding(indices)  # [B, H, W, embedding_dim]
+        z_q = z_q.permute(0, 3, 1, 2).contiguous()  # [B, embedding_dim, H, W]
+        
+        # Decode
+        x_recon = self.decoder(z_q)
+        return x_recon
+
     def encode_to_patches(self, x, patch_size):
         """Encode image into patches of different sizes"""
         B, C, H, W = x.shape

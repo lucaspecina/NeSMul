@@ -33,7 +33,7 @@ class ProgressiveVAR(nn.Module):
         self.patch_sizes = [16, 8, 4, 2]  # From coarse to fine
         
         # Position embeddings for each resolution
-        self.pos_embeddings = nn.ModuleDict({
+        self.pos_embeddings = nn.ParameterDict({
             str(size): nn.Parameter(torch.randn(1, (256//size)**2, embed_dim) * 0.02)
             for size in self.patch_sizes
         })
