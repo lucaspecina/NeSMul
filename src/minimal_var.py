@@ -24,6 +24,25 @@ class MultiHeadAttention(nn.Module):
         x = self.proj(x)
         return x
 
+class TransformerBlock(nn.Module):
+    def __init__(self, embed_dim, num_heads):
+        super().__init__()
+        self.ln1 = nn.LayerNorm(embed_dim)
+        self.attn = MultiHeadAttention(embed_dim, num_heads)
+        self.ln2 = nn.LayerNorm(embed_dim)
+        self.mlp = nn.Sequential(
+            nn.Linear(embed_dim, embed_dim * 4),
+            nn.GELU(),
+            nn.Linear(embed_dim * 4, embed_dim),
+        )
+    
+    def forward(self, x, mask=None):
+        attn_out = self.attn(self.ln1(x), mask=mask)
+        x = x + attn_out
+        mlp_out = self.mlp(self.ln2(x))
+        x = x + mlp_out
+        return x
+
 class ProgressiveVAR(nn.Module):
     def __init__(self, num_embeddings=1024, embed_dim=256, num_heads=8, num_layers=6):
         super().__init__()
@@ -41,15 +60,9 @@ class ProgressiveVAR(nn.Module):
         # Level embeddings to distinguish different resolutions
         self.level_embedding = nn.Parameter(torch.randn(len(self.patch_sizes), 1, embed_dim) * 0.02)
         
+        # Use custom TransformerBlock modules that accept a mask.
         self.transformer_layers = nn.ModuleList([
-            nn.Sequential(
-                nn.LayerNorm(embed_dim),
-                MultiHeadAttention(embed_dim, num_heads),
-                nn.LayerNorm(embed_dim),
-                nn.Linear(embed_dim, embed_dim * 4),
-                nn.GELU(),
-                nn.Linear(embed_dim * 4, embed_dim),
-            ) for _ in range(num_layers)
+            TransformerBlock(embed_dim, num_heads) for _ in range(num_layers)
         ])
         
         self.final_ln = nn.LayerNorm(embed_dim)
@@ -60,16 +73,16 @@ class ProgressiveVAR(nn.Module):
         indices_list: list of token indices at different resolutions
         current_level: which resolution we're currently training
         """
-        batch_size = indices_list[0].size(0)
-        
-        # Embed all available tokens
+        # Embed all available tokens (each token tensor might be a 2D grid; flatten if needed)
         embeddings = []
-        position = 0
         for level, indices in enumerate(indices_list[:current_level + 1]):
+            # If indices have spatial dimensions, flatten to shape [B, num_tokens]
+            if indices.dim() > 2:
+                indices = indices.view(indices.size(0), -1)
             # Token embedding
             x = self.token_embedding(indices)
             
-            # Add position embedding for this resolution
+            # Add positional embedding for this resolution
             patch_size = self.patch_sizes[level]
             x = x + self.pos_embeddings[str(patch_size)][:, :x.size(1)]
             
@@ -77,19 +90,17 @@ class ProgressiveVAR(nn.Module):
             x = x + self.level_embedding[level]
             
             embeddings.append(x)
-            position += x.size(1)
         
-        # Concatenate all embeddings
+        # Concatenate all embeddings along the sequence dimension.
         x = torch.cat(embeddings, dim=1)
         
-        # Create causal attention mask
+        # Create a causal attention mask if none is provided.
         if mask is None:
-            mask = torch.triu(torch.ones(x.size(1), x.size(1)), diagonal=1).bool()
-            mask = mask.to(x.device)
+            mask = torch.triu(torch.ones(x.size(1), x.size(1)), diagonal=1).bool().to(x.device)
         
-        # Apply transformer layers
+        # Apply transformer layers with mask.
         for layer in self.transformer_layers:
-            x = x + layer(x)
+            x = layer(x, mask=mask)
         
         x = self.final_ln(x)
         logits = self.head(x)

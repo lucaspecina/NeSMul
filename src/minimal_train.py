@@ -28,31 +28,34 @@ def train_progressive(vqvae, var, optimizer, images, device):
     losses = []
     batch_size = images.size(0)
     
-    # Get tokens at different resolutions
+    # Get tokens at different resolutions using full image encoding at different scales.
     tokens_at_scales = []
+    image_size = images.size(2)  # assuming square images (e.g. 256)
     with torch.no_grad():
         for patch_size in var.patch_sizes:
-            patches = vqvae.encode_to_patches(images, patch_size)
-            _, indices = vqvae(patches)
+            indices = vqvae.encode_to_indices_with_scale(images, image_size, patch_size)
             tokens_at_scales.append(indices)
     
-    # Progressive training through different resolutions
+    # Progressive training through different resolutions.
     for current_level in range(len(var.patch_sizes)):
-        # Prepare input and target sequences
+        # Prepare input and target sequences.
         input_sequences = tokens_at_scales[:current_level + 1]
-        target_indices = tokens_at_scales[current_level][:, 1:]  # All except first token
+        target_indices = tokens_at_scales[current_level]
+        if target_indices.dim() > 2:
+            target_indices = target_indices.view(target_indices.size(0), -1)
+        target_indices = target_indices[:, 1:]  # All except first token
         
-        # Forward pass
+        # Forward pass.
         logits = var(input_sequences, current_level)
         
-        # Calculate loss only on the current resolution's predictions
+        # Calculate loss only on the current resolution's predictions.
         current_level_logits = logits[:, -target_indices.size(1):]
         loss = F.cross_entropy(
             current_level_logits.view(-1, logits.size(-1)),
             target_indices.view(-1)
         )
         
-        # Backward pass
+        # Backward pass.
         optimizer.zero_grad()
         loss.backward()
         optimizer.step()
@@ -67,17 +70,16 @@ def generate_progressive(vqvae, var, device, image_size=256, temperature=1.0):
         batch_size = 1
         generated_tokens = []
         
-        # Generate from coarse to fine
+        # Generate progressive tokens from coarse to fine.
         for level, patch_size in enumerate(var.patch_sizes):
             num_patches = (image_size // patch_size) ** 2
             current_tokens = torch.zeros(batch_size, num_patches, dtype=torch.long).to(device)
             
-            # Generate tokens for current resolution
+            # Token-by-token autoregressive generation.
             for position in range(num_patches):
-                # Forward pass through VAR
                 logits = var(generated_tokens + [current_tokens], level)
                 
-                # Sample from the logits with temperature
+                # Sample from the logits with temperature.
                 next_token_logits = logits[:, -1, :] / temperature
                 probs = F.softmax(next_token_logits, dim=-1)
                 next_token = torch.multinomial(probs, 1)
@@ -85,20 +87,14 @@ def generate_progressive(vqvae, var, device, image_size=256, temperature=1.0):
             
             generated_tokens.append(current_tokens)
         
-        # Decode the final result
+        # Decode the final result using decode_from_indices.
         final_tokens = generated_tokens[-1]
-        patches = vqvae.quantizer.embedding(final_tokens)
-        reconstructed_image = vqvae.decode_from_patches(
-            patches,
-            var.patch_sizes[-1],
-            image_size,
-            image_size
-        )
+        reconstructed_image = vqvae.decode_from_indices(final_tokens)
         
         return reconstructed_image
 
 def main():
-    # Create output directories
+    # Create output directories.
     output_dir = Path("outputs")
     checkpoint_dir = output_dir / "checkpoints"
     sample_dir = output_dir / "samples"
@@ -108,15 +104,18 @@ def main():
     
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     
-    # Initialize models
+    # Initialize models.
     vqvae = SimpleVQVAE().to(device)
     var = ProgressiveVAR().to(device)
     
-    # Load VQVAE weights (assuming it's pretrained)
+    # Load VQVAE weights (assuming it's pretrained).
+    if not os.path.exists("vqvae_checkpoint.pt"):
+        print("VQVAE checkpoint 'vqvae_checkpoint.pt' not found. Please pretrain the VQVAE model.")
+        return
     vqvae.load_state_dict(torch.load("vqvae_checkpoint.pt"))
     vqvae.eval()
     
-    # Load dataset
+    # Load dataset (update the path as needed; here we use a local './data' folder).
     transform = transforms.Compose([
         transforms.Resize(256),
         transforms.CenterCrop(256),
@@ -124,19 +123,19 @@ def main():
         transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5))
     ])
     
-    dataset = datasets.ImageFolder("path/to/dataset", transform=transform)
+    dataset = datasets.ImageFolder("./data", transform=transform)  # updated dataset path
     dataloader = DataLoader(dataset, batch_size=32, shuffle=True, num_workers=4)
     
-    # Training setup
+    # Training setup.
     optimizer = torch.optim.Adam(var.parameters(), lr=1e-4)
     start_epoch = 0
     
-    # Load checkpoint if exists
+    # Load checkpoint if it exists.
     checkpoint_path = checkpoint_dir / "var_latest.pt"
     if checkpoint_path.exists():
         start_epoch = load_checkpoint(var, optimizer, checkpoint_path)
     
-    # Training loop
+    # Training loop.
     for epoch in range(start_epoch, 100):
         epoch_losses = []
         for batch_idx, (images, _) in enumerate(dataloader):
@@ -148,7 +147,7 @@ def main():
                 avg_loss = np.mean(epoch_losses[-100:])
                 print(f"Epoch: {epoch}, Batch: {batch_idx}, Loss: {avg_loss:.4f}")
                 
-                # Generate sample images with different temperatures
+                # Generate sample images with different temperatures.
                 for temp in [0.5, 1.0, 2.0]:
                     sample = generate_progressive(vqvae, var, device, temperature=temp)
                     save_image(
@@ -157,7 +156,7 @@ def main():
                         normalize=True
                     )
         
-        # Save checkpoint
+        # Save checkpoint.
         save_checkpoint(var, optimizer, epoch, checkpoint_dir / "var_latest.pt")
         if epoch % 10 == 0:
             save_checkpoint(var, optimizer, epoch, checkpoint_dir / f"var_epoch_{epoch}.pt")
